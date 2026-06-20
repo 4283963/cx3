@@ -39,6 +39,8 @@ func SetupRouter(cfg *config.Config) *gin.Engine {
 			shelf.POST("/unlock", middleware.LockRateLimit(), shelfController.Unlock)
 			shelf.GET("/status/:shelf_id", shelfController.GetStatus)
 			shelf.GET("/stock/:shelf_id/:slot_no", shelfController.GetStock)
+			shelf.GET("/check/:shelf_id", shelfController.SelfCheck)
+			shelf.GET("/audit/:shelf_id", shelfController.GetAuditLogs)
 		}
 
 		health := api.Group("/health")

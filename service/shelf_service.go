@@ -83,6 +83,21 @@ func (s *ShelfService) Pickup(ctx context.Context, req *model.PickupRequest, cli
 		}
 	}
 
+	redisSlotProduct, _ := s.stockRepo.GetShelfProduct(ctx, req.ShelfID, req.SlotNo)
+	if redisSlotProduct != "" && redisSlotProduct != req.ProductID {
+		utils.SugarLogger.Errorw("REDIS SLOT-PRODUCT MISMATCH DETECTED",
+			zap.String("trace_id", traceID),
+			zap.String("shelf_id", req.ShelfID),
+			zap.Int("slot_no", req.SlotNo),
+			zap.String("expected_product", req.ProductID),
+			zap.String("actual_redis_product", redisSlotProduct),
+		)
+		return &PickupResult{
+			ErrCode: utils.CodeSlotMismatch,
+			Err:     fmt.Errorf("%w: Redis货道商品不匹配: 期望=%s 实际=%s", ErrSlotMismatch, req.ProductID, redisSlotProduct),
+		}
+	}
+
 	decrResult, err := s.stockRepo.DecrStock(ctx, req.ShelfID, req.SlotNo, req.ProductID,
 		req.Quantity, req.IdempotentKey)
 	if err != nil {
@@ -123,6 +138,79 @@ func (s *ShelfService) Pickup(ctx context.Context, req *model.PickupRequest, cli
 
 	switch decrResult.ErrCode {
 	case 1:
+		luaExpectedDeduct := decrResult.StockBefore - decrResult.StockAfter
+		if luaExpectedDeduct != req.Quantity {
+			utils.SugarLogger.Fatalw("LUA DEDUCT AMOUNT MISMATCH",
+				zap.String("trace_id", traceID),
+				zap.String("shelf_id", req.ShelfID),
+				zap.Int("slot_no", req.SlotNo),
+				zap.String("product_id", req.ProductID),
+				zap.Int("requested_qty", req.Quantity),
+				zap.Int("lua_stock_before", decrResult.StockBefore),
+				zap.Int("lua_stock_after", decrResult.StockAfter),
+				zap.Int("lua_deduct", luaExpectedDeduct),
+			)
+			return &PickupResult{
+				ErrCode: utils.CodeInternalError,
+				Err:     fmt.Errorf("致命错误: Lua扣减量=%d, 请求量=%d", luaExpectedDeduct, req.Quantity),
+			}
+		}
+
+		postStock, getErr := s.stockRepo.GetStock(ctx, req.ShelfID, req.SlotNo)
+		if getErr != nil {
+			utils.SugarLogger.Errorw("post-check get stock failed",
+				zap.String("trace_id", traceID),
+				zap.String("shelf_id", req.ShelfID),
+				zap.Int("slot_no", req.SlotNo),
+				zap.Error(getErr),
+			)
+		} else {
+			if postStock < 0 {
+				utils.SugarLogger.Fatalw("NEGATIVE STOCK DETECTED",
+					zap.String("trace_id", traceID),
+					zap.String("shelf_id", req.ShelfID),
+					zap.Int("slot_no", req.SlotNo),
+					zap.String("product_id", req.ProductID),
+					zap.Int("requested_qty", req.Quantity),
+					zap.Int("lua_stock_after", decrResult.StockAfter),
+					zap.Int("redis_post_stock", postStock),
+				)
+				return &PickupResult{
+					ErrCode: utils.CodeInternalError,
+					Err:     fmt.Errorf("致命错误: 货道%d出现负库存=%d", req.SlotNo, postStock),
+				}
+			}
+			if postStock > decrResult.StockAfter {
+				utils.SugarLogger.Fatalw("STOCK INCREASED AFTER DEDUCT",
+					zap.String("trace_id", traceID),
+					zap.String("shelf_id", req.ShelfID),
+					zap.Int("slot_no", req.SlotNo),
+					zap.String("product_id", req.ProductID),
+					zap.Int("requested_qty", req.Quantity),
+					zap.Int("lua_stock_after", decrResult.StockAfter),
+					zap.Int("redis_post_stock", postStock),
+				)
+				return &PickupResult{
+					ErrCode: utils.CodeInternalError,
+					Err:     fmt.Errorf("致命错误: 扣减后库存反而增加: Lua返回=%d, Redis实际=%d", decrResult.StockAfter, postStock),
+				}
+			}
+		}
+
+		postProduct, getErr2 := s.stockRepo.GetShelfProduct(ctx, req.ShelfID, req.SlotNo)
+		if getErr2 == nil && postProduct != "" && postProduct != req.ProductID {
+			utils.SugarLogger.Fatalw("PRODUCT MAPPING CORRUPTED",
+				zap.String("trace_id", traceID),
+				zap.String("shelf_id", req.ShelfID),
+				zap.Int("slot_no", req.SlotNo),
+				zap.String("expected_product", req.ProductID),
+				zap.String("actual_redis_product", postProduct),
+			)
+			return &PickupResult{
+				ErrCode: utils.CodeInternalError,
+				Err:     fmt.Errorf("致命映射错误: 货道%d应存放=%s, Redis实际=%s", req.SlotNo, req.ProductID, postProduct),
+			}
+		}
 	case -1:
 		return &PickupResult{
 			ErrCode: utils.CodeStockNotEnough,
@@ -513,4 +601,78 @@ func (s *ShelfService) GetStock(ctx context.Context, shelfID string, slotNo int)
 	info.IsSoldOut = quantity == 0
 
 	return info, nil
+}
+
+type SelfCheckResult struct {
+	ShelfID        string              `json:"shelf_id"`
+	CheckedAt      int64               `json:"checked_at"`
+	TotalSlots     int                 `json:"total_slots"`
+	MismatchSlots  []map[string]string `json:"mismatch_slots"`
+	NegativeStocks []map[string]string `json:"negative_stocks"`
+	AnomalyCount   int                 `json:"anomaly_count"`
+	IsHealthy      bool                `json:"is_healthy"`
+}
+
+func (s *ShelfService) SelfCheck(ctx context.Context, shelfID string, maxSlot int) (*SelfCheckResult, error) {
+	traceID := utils.TraceIDFromContext(ctx)
+	result := &SelfCheckResult{
+		ShelfID:   shelfID,
+		CheckedAt: utils.NowUnix(),
+		IsHealthy: true,
+	}
+
+	if maxSlot <= 0 || maxSlot > 200 {
+		maxSlot = 50
+	}
+
+	for sn := 1; sn <= maxSlot; sn++ {
+		redisProduct, _ := s.stockRepo.GetShelfProduct(ctx, shelfID, sn)
+		mysqlSP, _ := s.shelfRepo.GetShelfProduct(ctx, shelfID, sn)
+
+		if mysqlSP != nil {
+			result.TotalSlots++
+			if redisProduct != "" && redisProduct != mysqlSP.ProductID {
+				result.MismatchSlots = append(result.MismatchSlots, map[string]string{
+					"slot":        fmt.Sprintf("%d", sn),
+					"mysql_prod":  mysqlSP.ProductID,
+					"redis_prod":  redisProduct,
+				})
+				result.AnomalyCount++
+				result.IsHealthy = false
+				utils.SugarLogger.Errorw("SELF-CHECK: PRODUCT MISMATCH",
+					zap.String("trace_id", traceID),
+					zap.String("shelf_id", shelfID),
+					zap.Int("slot_no", sn),
+					zap.String("mysql_prod", mysqlSP.ProductID),
+					zap.String("redis_prod", redisProduct),
+				)
+			}
+
+			stock, _ := s.stockRepo.GetStock(ctx, shelfID, sn)
+			if stock < 0 {
+				result.NegativeStocks = append(result.NegativeStocks, map[string]string{
+					"slot":        fmt.Sprintf("%d", sn),
+					"product_id":  mysqlSP.ProductID,
+					"stock":       fmt.Sprintf("%d", stock),
+				})
+				result.AnomalyCount++
+				result.IsHealthy = false
+				utils.SugarLogger.Errorw("SELF-CHECK: NEGATIVE STOCK",
+					zap.String("trace_id", traceID),
+					zap.String("shelf_id", shelfID),
+					zap.Int("slot_no", sn),
+					zap.String("product_id", mysqlSP.ProductID),
+					zap.Int("stock", stock),
+				)
+			}
+		} else if redisProduct != "" {
+			result.TotalSlots++
+		}
+	}
+
+	return result, nil
+}
+
+func (s *ShelfService) GetAuditLogs(ctx context.Context, shelfID string, limit int64) ([]string, error) {
+	return s.stockRepo.GetAuditLogs(ctx, shelfID, limit)
 }

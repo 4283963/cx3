@@ -253,3 +253,115 @@ func TestShelfService_StockNotEnough(t *testing.T) {
 	finalStock, _ := client.Get(ctx, utils.BuildShelfStockKey(shelfID, slotNo)).Int()
 	assert.Equal(t, 2, finalStock, "库存不足时不应扣减")
 }
+
+func TestShelfService_MultiSlot_Concurrent(t *testing.T) {
+	service, client, mr := setupTestShelfService(t)
+	defer mr.Close()
+
+	ctx := utils.ContextWithTraceID(context.Background(), "test-multislot-concurrent")
+	shelfID := "SH-TEST-MULTI"
+
+	const slotCount = 10
+	const initialStock = 100
+	const perQty = 1
+	const requestsPerSlot = 80
+	const totalRequests = slotCount * requestsPerSlot
+
+	type slotInfo struct {
+		ProductID string
+		Initial   int
+	}
+	slots := make([]slotInfo, slotCount)
+
+	for s := 0; s < slotCount; s++ {
+		slotNo := s + 1
+		pid := fmt.Sprintf("P-SLOT-%02d", slotNo)
+		slots[s] = slotInfo{ProductID: pid, Initial: initialStock}
+
+		client.Set(ctx, utils.BuildShelfStockKey(shelfID, slotNo), initialStock, 0)
+		client.Set(ctx, utils.BuildShelfProductKey(shelfID, slotNo), pid, 0)
+		pJSON, _ := json.Marshal(&model.Product{ProductID: pid, SKU: fmt.Sprintf("SKU%02d", slotNo), Name: fmt.Sprintf("商品%d号", slotNo), Price: 100 + int64(slotNo)*10})
+		client.Set(ctx, utils.BuildProductInfoKey(pid), pJSON, time.Hour)
+	}
+
+	var slotSuccess [slotCount]int32
+	var slotFail [slotCount]int32
+	var wg sync.WaitGroup
+
+	start := make(chan struct{})
+	reqIdx := int64(0)
+
+	for r := 0; r < totalRequests; r++ {
+		s := r % slotCount
+		slotNo := s + 1
+		wg.Add(1)
+		go func(slotIdx, sn int) {
+			defer wg.Done()
+			<-start
+			n := atomic.AddInt64(&reqIdx, 1)
+			pid := slots[slotIdx].ProductID
+			req := &model.PickupRequest{
+				RequestID:     fmt.Sprintf("REQ-MULTI-%d-%d", time.Now().UnixNano(), n),
+				IdempotentKey: fmt.Sprintf("IDEM-MULTI-%d-%d", n, slotIdx),
+				ShelfID:       shelfID,
+				UserID:        fmt.Sprintf("USER-%d", n%50),
+				ProductID:     pid,
+				Quantity:      perQty,
+				SlotNo:        sn,
+			}
+			result := service.Pickup(ctx, req, fmt.Sprintf("10.0.0.%d", n%256))
+			if result.ErrCode == utils.CodeSuccess {
+				atomic.AddInt32(&slotSuccess[slotIdx], 1)
+			} else {
+				atomic.AddInt32(&slotFail[slotIdx], 1)
+			}
+		}(s, slotNo)
+	}
+
+	close(start)
+	wg.Wait()
+
+	t.Log("============= 多货道并发结果 =============")
+	t.Logf("总请求: %d (每货道 %d 请求)", totalRequests, requestsPerSlot)
+	t.Logf("%-8s %-12s %-10s %-10s %-12s %-12s %-8s", "SLOT", "PRODUCT", "INIT", "SUCCESS", "EXPECT_DED", "ACTUAL_STOCK", "MATCH?")
+
+	allCorrect := true
+	for s := 0; s < slotCount; s++ {
+		slotNo := s + 1
+		pid := slots[s].ProductID
+		success := int(slotSuccess[s])
+		expectedDeducted := success * perQty
+		expectedFinal := initialStock - expectedDeducted
+		actualFinal, _ := client.Get(ctx, utils.BuildShelfStockKey(shelfID, slotNo)).Int()
+		actualProduct, _ := client.Get(ctx, utils.BuildShelfProductKey(shelfID, slotNo)).Result()
+
+		match := actualFinal == expectedFinal && actualProduct == pid
+		if !match {
+			allCorrect = false
+		}
+
+		status := "✓"
+		if !match {
+			status = fmt.Sprintf("✗ (stock=%d/%d prod=%s/%s)", actualFinal, expectedFinal, actualProduct, pid)
+		}
+		t.Logf("%-8d %-12s %-10d %-10d %-12d %-12d %-8s", slotNo, pid, initialStock, success, expectedDeducted, actualFinal, status)
+	}
+
+	t.Log("==========================================")
+
+	assert.True(t, allCorrect, "多货道并发时，每个货道的库存和商品对应关系必须完全正确")
+
+	for s := 0; s < slotCount; s++ {
+		slotNo := s + 1
+		pid := slots[s].ProductID
+		success := int(slotSuccess[s])
+		expectedDeducted := success * perQty
+		expectedFinal := initialStock - expectedDeducted
+		actualFinal, _ := client.Get(ctx, utils.BuildShelfStockKey(shelfID, slotNo)).Int()
+		actualProduct, _ := client.Get(ctx, utils.BuildShelfProductKey(shelfID, slotNo)).Result()
+
+		assert.Equal(t, expectedFinal, actualFinal, "货道 %d 最终库存不正确", slotNo)
+		assert.Equal(t, pid, actualProduct, "货道 %d 商品映射被污染！期望 %s, 实际 %s", slotNo, pid, actualProduct)
+		assert.True(t, actualFinal >= 0, "货道 %d 库存不能为负数: %d", slotNo, actualFinal)
+	}
+}

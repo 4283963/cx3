@@ -50,15 +50,18 @@ func (r *StockRepo) DecrStock(ctx context.Context, shelfID string, slotNo int, p
 	lockKey := utils.BuildShelfLockKey(shelfID)
 	productKey := utils.BuildShelfProductKey(shelfID, slotNo)
 	idemKey := utils.BuildIdempotentKey(idempotentKey)
+	auditKey := utils.BuildAuditLogKey(shelfID)
 
 	ttl := r.cfg.Idempotent.TTLSeconds
 	if ttl <= 0 {
 		ttl = 300
 	}
+	traceID := utils.TraceIDFromContext(ctx)
+	ts := strconv.FormatInt(utils.NowUnixMilli(), 10)
 
 	result, err := decrStockScript.Run(ctx, r.client,
-		[]string{stockKey, lockKey, productKey, idemKey},
-		quantity, productID, idempotentKey, ttl,
+		[]string{stockKey, lockKey, productKey, idemKey, auditKey},
+		quantity, productID, idempotentKey, ttl, traceID, ts,
 	).Text()
 
 	if err != nil {
@@ -309,4 +312,36 @@ func (r *StockRepo) GetETag(ctx context.Context, shelfID string) (int64, error) 
 		return 0, nil
 	}
 	return val, err
+}
+
+func (r *StockRepo) GetAuditLogs(ctx context.Context, shelfID string, limit int64) ([]string, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	auditKey := utils.BuildAuditLogKey(shelfID)
+	start := -limit
+	end := int64(-1)
+	return r.client.LRange(ctx, auditKey, start, end).Result()
+}
+
+func (r *StockRepo) GetShelfSlotCount(ctx context.Context, shelfID string) (int, error) {
+	pattern := utils.BuildShelfStockKey(shelfID, 0)
+	pattern = pattern[:len(pattern)-1] + "*"
+	var cursor uint64
+	var keys []string
+	var count int
+	for {
+		var batch []string
+		var err error
+		batch, cursor, err = r.client.Scan(ctx, cursor, pattern, 100).Result()
+		if err != nil {
+			return 0, err
+		}
+		keys = append(keys, batch...)
+		if cursor == 0 {
+			break
+		}
+	}
+	count = len(keys)
+	return count, nil
 }

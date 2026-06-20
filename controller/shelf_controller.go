@@ -180,3 +180,45 @@ func (ctl *ShelfController) GetStock(c *gin.Context) {
 
 	utils.Success(c, info)
 }
+
+func (ctl *ShelfController) SelfCheck(c *gin.Context) {
+	shelfID := c.Param("shelf_id")
+	maxSlotStr := c.DefaultQuery("max_slot", "50")
+
+	maxSlot, err := strconv.Atoi(maxSlotStr)
+	if err != nil || maxSlot <= 0 {
+		maxSlot = 50
+	}
+
+	ctx := utils.ContextWithTraceID(c.Request.Context(), utils.GetTraceID(c))
+	result, err := ctl.shelfService.SelfCheck(ctx, shelfID, maxSlot)
+	if err != nil {
+		utils.Fail(c, http.StatusInternalServerError, utils.CodeInternalError, err.Error())
+		return
+	}
+
+	utils.Success(c, result)
+}
+
+func (ctl *ShelfController) GetAuditLogs(c *gin.Context) {
+	shelfID := c.Param("shelf_id")
+	limitStr := c.DefaultQuery("limit", "100")
+
+	limit, err := strconv.ParseInt(limitStr, 10, 64)
+	if err != nil || limit <= 0 {
+		limit = 100
+	}
+
+	ctx := utils.ContextWithTraceID(c.Request.Context(), utils.GetTraceID(c))
+	logs, err := ctl.shelfService.GetAuditLogs(ctx, shelfID, limit)
+	if err != nil {
+		utils.Fail(c, http.StatusInternalServerError, utils.CodeInternalError, err.Error())
+		return
+	}
+
+	utils.Success(c, gin.H{
+		"shelf_id":    shelfID,
+		"total_count": len(logs),
+		"logs":        logs,
+	})
+}

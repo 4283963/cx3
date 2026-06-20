@@ -55,38 +55,67 @@ local stock_key = KEYS[1]
 local lock_key = KEYS[2]
 local product_key = KEYS[3]
 local idempotent_key = KEYS[4]
+local audit_key = KEYS[5]
 local quantity = tonumber(ARGV[1])
 local expected_product = ARGV[2]
 local idempotent_val = ARGV[3]
 local ttl_seconds = tonumber(ARGV[4])
+local trace_id = ARGV[5]
+local ts = ARGV[6]
+
+local result_code = '0'
+local result_payload = ''
+
+local function append_audit(status, detail)
+    local log_entry = table.concat({
+        'ts=', ts,
+        ',trace=', trace_id,
+        ',idem=', idempotent_val,
+        ',qty=', tostring(quantity),
+        ',exp=', expected_product,
+        ',cur=', (redis.call('GET', product_key) or ''),
+        ',stk_bef=', (redis.call('GET', stock_key) or '0'),
+        ',stk_aft=', '',
+        ',status=', status,
+        ',detail=', detail
+    }, '')
+    redis.call('RPUSH', audit_key, log_entry)
+    redis.call('LTRIM', audit_key, -50000, -1)
+end
 
 if redis.call('EXISTS', idempotent_key) == 1 then
     local prev_result = redis.call('GET', idempotent_key)
+    append_audit('DUP', prev_result)
     return '-2:' .. prev_result
 end
 
 local is_locked = redis.call('EXISTS', lock_key)
 if is_locked == 1 then
     local lock_info = redis.call('GET', lock_key)
+    append_audit('LOCKED', string.sub(lock_info or '', 1, 80))
     return '-3:' .. (lock_info or '')
 end
 
 if expected_product ~= '' then
     local current_product = redis.call('GET', product_key)
     if current_product ~= expected_product then
+        append_audit('MISMATCH', 'got=' .. (current_product or 'nil') .. ';want=' .. expected_product)
         return '-4:' .. (current_product or '')
     end
 end
 
 local current_stock = tonumber(redis.call('GET', stock_key) or '0')
 if current_stock < quantity then
+    append_audit('NOSTOCK', 'have=' .. tostring(current_stock) .. ';need=' .. tostring(quantity))
     return '-1:' .. tostring(current_stock)
 end
 
 local new_stock = current_stock - quantity
 redis.call('SET', stock_key, new_stock)
-redis.call('SETEX', idempotent_key, ttl_seconds, tostring(current_stock) .. ':' .. tostring(new_stock))
+local idem_payload = tostring(current_stock) .. ':' .. tostring(new_stock)
+redis.call('SETEX', idempotent_key, ttl_seconds, idem_payload)
 
+append_audit('OK', 'deducted=' .. tostring(quantity))
 return '1:' .. tostring(current_stock) .. ':' .. tostring(new_stock)
 `
 

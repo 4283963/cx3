@@ -79,35 +79,52 @@ func GetRequestID(c *gin.Context) string {
 }
 
 func BuildShelfStockKey(shelfID string, slotNo int) string {
-	return fmt.Sprintf("shelf:stock:%s:%d", shelfID, slotNo)
+	return fmt.Sprintf("shelf:stock:{%s}:%d", shelfID, slotNo)
 }
 
 func BuildShelfProductKey(shelfID string, slotNo int) string {
-	return fmt.Sprintf("shelf:product:%s:%d", shelfID, slotNo)
+	return fmt.Sprintf("shelf:product:{%s}:%d", shelfID, slotNo)
 }
 
 func BuildShelfStatusKey(shelfID string) string {
-	return fmt.Sprintf("shelf:status:%s", shelfID)
+	return fmt.Sprintf("shelf:status:{%s}", shelfID)
 }
 
 func BuildShelfLockKey(shelfID string) string {
-	return fmt.Sprintf("shelf:lock:%s", shelfID)
+	return fmt.Sprintf("shelf:lock:{%s}", shelfID)
 }
 
 func BuildProductInfoKey(productID string) string {
-	return fmt.Sprintf("product:info:%s", productID)
+	return fmt.Sprintf("product:info:{%s}", productID)
 }
 
 func BuildETagKey(shelfID string) string {
-	return fmt.Sprintf("shelf:etag:%s", shelfID)
+	return fmt.Sprintf("shelf:etag:{%s}", shelfID)
 }
 
 func BuildIdempotentKey(key string) string {
-	return fmt.Sprintf("idempotent:%s", key)
+	if shelfID := extractShelfIDFromIdempotent(key); shelfID != "" {
+		return fmt.Sprintf("idempotent:{%s}:%s", shelfID, key)
+	}
+	return fmt.Sprintf("idempotent:global:%s", key)
+}
+
+func extractShelfIDFromIdempotent(key string) string {
+	parts := strings.Split(key, ":")
+	for _, p := range parts {
+		if strings.HasPrefix(p, "SH-") || strings.HasPrefix(p, "sh-") {
+			return p
+		}
+	}
+	return ""
 }
 
 func BuildUserPickingKey(userID string, shelfID string) string {
-	return fmt.Sprintf("user:picking:%s:%s", userID, shelfID)
+	return fmt.Sprintf("user:picking:{%s}:%s", shelfID, userID)
+}
+
+func BuildAuditLogKey(shelfID string) string {
+	return fmt.Sprintf("audit:shelf:{%s}", shelfID)
 }
 
 func NowUnix() int64 {
