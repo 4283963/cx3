@@ -90,6 +90,9 @@ CREATE TABLE `transaction` (
     `remark`          VARCHAR(512)  DEFAULT NULL COMMENT '备注',
     `stock_before`    INT           DEFAULT NULL COMMENT '扣减前库存',
     `stock_after`     INT           DEFAULT NULL COMMENT '扣减后库存',
+    `original_price`  BIGINT        DEFAULT NULL COMMENT '商品原价(分)',
+    `promo_id`        VARCHAR(64)   DEFAULT NULL COMMENT '促销活动ID',
+    `promo_name`      VARCHAR(128)  DEFAULT NULL COMMENT '促销活动名称',
     `confirm_at`      BIGINT        DEFAULT NULL COMMENT '确认时间戳',
     `created_at`      DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
     `updated_at`      DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -101,7 +104,8 @@ CREATE TABLE `transaction` (
     KEY `idx_order_id` (`order_id`),
     KEY `idx_product_id` (`product_id`),
     KEY `idx_store_id` (`store_id`),
-    KEY `idx_created_at` (`created_at`)
+    KEY `idx_created_at` (`created_at`),
+    KEY `idx_promo_id` (`promo_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='交易记录表';
 
 INSERT INTO `shelf` (`shelf_id`, `store_id`, `name`, `status`, `zone`) VALUES

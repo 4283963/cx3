@@ -127,6 +127,10 @@ func BuildAuditLogKey(shelfID string) string {
 	return fmt.Sprintf("audit:shelf:{%s}", shelfID)
 }
 
+func BuildPromoKey(shelfID string, slotNo int) string {
+	return fmt.Sprintf("shelf:promo:{%s}:%d", shelfID, slotNo)
+}
+
 func NowUnix() int64 {
 	return time.Now().Unix()
 }

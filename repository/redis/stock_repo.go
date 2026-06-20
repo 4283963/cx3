@@ -345,3 +345,93 @@ func (r *StockRepo) GetShelfSlotCount(ctx context.Context, shelfID string) (int,
 	count = len(keys)
 	return count, nil
 }
+
+type PromoGetResult struct {
+	Found    bool
+	Active   bool
+	NotStart bool
+	Expired  bool
+	Promo    *model.ShelfPromotion
+}
+
+func (r *StockRepo) SetPromo(ctx context.Context, promo *model.ShelfPromotion) error {
+	promoKey := utils.BuildPromoKey(promo.ShelfID, promo.SlotNo)
+	raw := fmt.Sprintf("%s|%s|%s|%d|%d|%d|%s",
+		promo.PromoID, promo.PromoName, promo.ProductID,
+		promo.PromoPrice, promo.StartAt, promo.EndAt, promo.CreatedBy,
+	)
+	ttl := time.Duration(promo.EndAt-utils.NowUnix()+60) * time.Second
+	if ttl <= 0 {
+		ttl = 60 * time.Second
+	}
+	return r.client.Set(ctx, promoKey, raw, ttl).Err()
+}
+
+func parsePromoRaw(raw string) *model.ShelfPromotion {
+	if raw == "" {
+		return nil
+	}
+	parts := strings.SplitN(raw, "|", 7)
+	if len(parts) < 7 {
+		return nil
+	}
+	promoPrice, _ := strconv.ParseInt(parts[3], 10, 64)
+	startAt, _ := strconv.ParseInt(parts[4], 10, 64)
+	endAt, _ := strconv.ParseInt(parts[5], 10, 64)
+	return &model.ShelfPromotion{
+		PromoID:    parts[0],
+		PromoName:  parts[1],
+		ProductID:  parts[2],
+		PromoPrice: promoPrice,
+		StartAt:    startAt,
+		EndAt:      endAt,
+		CreatedBy:  parts[6],
+	}
+}
+
+func (r *StockRepo) GetPromo(ctx context.Context, shelfID string, slotNo int) (*PromoGetResult, error) {
+	promoKey := utils.BuildPromoKey(shelfID, slotNo)
+	now := strconv.FormatInt(utils.NowUnix(), 10)
+
+	result, err := getPromoScript.Run(ctx, r.client, []string{promoKey}, now).Text()
+	if err != nil {
+		return nil, err
+	}
+
+	idx := strings.Index(result, ":")
+	if idx < 0 {
+		return &PromoGetResult{Found: false}, nil
+	}
+	code := result[:idx]
+	rest := result[idx+1:]
+
+	switch code {
+	case "1":
+		promo := parsePromoRaw(rest)
+		if promo == nil {
+			return &PromoGetResult{Found: false}, nil
+		}
+		promo.ShelfID = shelfID
+		promo.SlotNo = slotNo
+		return &PromoGetResult{Found: true, Active: true, Promo: promo}, nil
+	case "-1":
+		promo := parsePromoRaw(rest)
+		if promo == nil {
+			return &PromoGetResult{Found: false}, nil
+		}
+		promo.ShelfID = shelfID
+		promo.SlotNo = slotNo
+		return &PromoGetResult{Found: true, NotStart: true, Promo: promo}, nil
+	default:
+		return &PromoGetResult{Found: false}, nil
+	}
+}
+
+func (r *StockRepo) CancelPromo(ctx context.Context, shelfID string, slotNo int, promoID string) (bool, error) {
+	promoKey := utils.BuildPromoKey(shelfID, slotNo)
+	result, err := cancelPromoScript.Run(ctx, r.client, []string{promoKey}, promoID).Text()
+	if err != nil {
+		return false, err
+	}
+	return strings.HasPrefix(result, "1:"), nil
+}

@@ -222,3 +222,65 @@ func (ctl *ShelfController) GetAuditLogs(c *gin.Context) {
 		"logs":        logs,
 	})
 }
+
+func (ctl *ShelfController) SetPromo(c *gin.Context) {
+	var req model.SetPromoRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		utils.Fail(c, http.StatusBadRequest, utils.CodeBadRequest, err.Error())
+		return
+	}
+
+	ctx := utils.ContextWithTraceID(c.Request.Context(), utils.GetTraceID(c))
+	result := ctl.shelfService.SetPromo(ctx, &req)
+	if result.ErrCode != utils.CodeSuccess {
+		msg := result.Err.Error()
+		if msg == "" {
+			msg = "设置促销失败"
+		}
+		utils.Fail(c, http.StatusOK, result.ErrCode, msg)
+		return
+	}
+	utils.Success(c, result.Response)
+}
+
+func (ctl *ShelfController) CancelPromo(c *gin.Context) {
+	var req model.CancelPromoRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		utils.Fail(c, http.StatusBadRequest, utils.CodeBadRequest, err.Error())
+		return
+	}
+
+	ctx := utils.ContextWithTraceID(c.Request.Context(), utils.GetTraceID(c))
+	result := ctl.shelfService.CancelPromo(ctx, &req)
+	if result.ErrCode != utils.CodeSuccess {
+		msg := result.Err.Error()
+		if msg == "" {
+			msg = "取消促销失败"
+		}
+		utils.Fail(c, http.StatusOK, result.ErrCode, msg)
+		return
+	}
+	utils.Success(c, result.Response)
+}
+
+func (ctl *ShelfController) GetPromo(c *gin.Context) {
+	shelfID := c.Param("shelf_id")
+	slotNoStr := c.Param("slot_no")
+	if shelfID == "" || slotNoStr == "" {
+		utils.Fail(c, http.StatusBadRequest, utils.CodeBadRequest, "shelf_id and slot_no are required")
+		return
+	}
+	slotNo, err := strconv.Atoi(slotNoStr)
+	if err != nil || slotNo <= 0 {
+		utils.Fail(c, http.StatusBadRequest, utils.CodeBadRequest, "slot_no must be positive integer")
+		return
+	}
+
+	ctx := utils.ContextWithTraceID(c.Request.Context(), utils.GetTraceID(c))
+	result, err := ctl.shelfService.GetPromo(ctx, shelfID, slotNo)
+	if err != nil {
+		utils.Fail(c, http.StatusInternalServerError, utils.CodeInternalError, err.Error())
+		return
+	}
+	utils.Success(c, result)
+}

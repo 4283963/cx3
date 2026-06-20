@@ -20,7 +20,11 @@ type PickupResponse struct {
 	StockBefore   int    `json:"stock_before"`
 	StockAfter    int    `json:"stock_after"`
 	UnitPrice     int64  `json:"unit_price"`
+	OriginalPrice int64  `json:"original_price"`
 	TotalAmount   int64  `json:"total_amount"`
+	DiscountAmt   int64  `json:"discount_amt"`
+	PromoID       string `json:"promo_id,omitempty"`
+	PromoName     string `json:"promo_name,omitempty"`
 	PickupAt      int64  `json:"pickup_at"`
 	IsDuplicate   bool   `json:"is_duplicate"`
 }
@@ -80,6 +84,50 @@ type ShelfStatusInfo struct {
 	LockType  int         `json:"lock_type,omitempty"`
 	LockUntil int64       `json:"lock_until,omitempty"`
 	Reason    string      `json:"reason,omitempty"`
+}
+
+type SetPromoRequest struct {
+	RequestID     string `json:"request_id" binding:"required,max=64"`
+	IdempotentKey string `json:"idempotent_key" binding:"required,max=128"`
+	PromoID       string `json:"promo_id" binding:"required,max=64"`
+	PromoName     string `json:"promo_name" binding:"required,max=128"`
+	ShelfID       string `json:"shelf_id" binding:"required,max=64"`
+	SlotNo        int    `json:"slot_no" binding:"required,min=1"`
+	ProductID     string `json:"product_id" binding:"required,max=64"`
+	PromoPrice    int64  `json:"promo_price" binding:"required,min=0"`
+	StartAt       int64  `json:"start_at" binding:"required"`
+	EndAt         int64  `json:"end_at" binding:"required"`
+	OperatorID    string `json:"operator_id" binding:"required,max=64"`
+	OperatorName  string `json:"operator_name" binding:"required,max=64"`
+}
+
+type SetPromoResponse struct {
+	PromoID    string `json:"promo_id"`
+	ShelfID    string `json:"shelf_id"`
+	SlotNo     int    `json:"slot_no"`
+	ProductID  string `json:"product_id"`
+	PromoPrice int64  `json:"promo_price"`
+	StartAt    int64  `json:"start_at"`
+	EndAt      int64  `json:"end_at"`
+	CreatedAt  int64  `json:"created_at"`
+	IsActive   bool   `json:"is_active"`
+}
+
+type CancelPromoRequest struct {
+	RequestID    string `json:"request_id" binding:"required,max=64"`
+	PromoID      string `json:"promo_id" binding:"required,max=64"`
+	ShelfID      string `json:"shelf_id" binding:"required,max=64"`
+	SlotNo       int    `json:"slot_no" binding:"required,min=1"`
+	OperatorID   string `json:"operator_id" binding:"required,max=64"`
+	OperatorName string `json:"operator_name" binding:"required,max=64"`
+}
+
+type CancelPromoResponse struct {
+	PromoID   string `json:"promo_id"`
+	ShelfID   string `json:"shelf_id"`
+	SlotNo    int    `json:"slot_no"`
+	Canceled  bool   `json:"canceled"`
+	CanceledAt int64 `json:"canceled_at"`
 }
 
 type Response struct {

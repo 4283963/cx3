@@ -365,3 +365,167 @@ func TestShelfService_MultiSlot_Concurrent(t *testing.T) {
 		assert.True(t, actualFinal >= 0, "货道 %d 库存不能为负数: %d", slotNo, actualFinal)
 	}
 }
+
+func TestShelfService_Promo_PriceApplied(t *testing.T) {
+	service, client, mr := setupTestShelfService(t)
+	defer mr.Close()
+
+	ctx := utils.ContextWithTraceID(context.Background(), "test-promo-apply")
+	shelfID := "SH-TEST-PROMO"
+	slotNo := 1
+	productID := "P-PROMO-001"
+	originalPrice := int64(300)
+	promoPrice := int64(99)
+	initialStock := 10
+
+	client.Set(ctx, utils.BuildShelfStockKey(shelfID, slotNo), initialStock, 0)
+	client.Set(ctx, utils.BuildShelfProductKey(shelfID, slotNo), productID, 0)
+	productJSON, _ := json.Marshal(&model.Product{ProductID: productID, SKU: "SKU-PROMO", Name: "临期商品特价", Price: originalPrice})
+	client.Set(ctx, utils.BuildProductInfoKey(productID), productJSON, time.Hour)
+
+	t.Log("=== 阶段 1：未设促销，按原价计算 ===")
+	req1 := &model.PickupRequest{
+		RequestID:     "REQ-NO-PROMO-1",
+		IdempotentKey: "IDEM-NO-PROMO-1",
+		ShelfID:       shelfID,
+		UserID:        "USER-001",
+		ProductID:     productID,
+		Quantity:      1,
+		SlotNo:        slotNo,
+	}
+	result1 := service.Pickup(ctx, req1, "127.0.0.1")
+	assert.Equal(t, utils.CodeSuccess, result1.ErrCode, "无促销时扣减应成功")
+	assert.Equal(t, originalPrice, result1.Response.UnitPrice, "无促销时单价应为原价")
+	assert.Equal(t, originalPrice, result1.Response.TotalAmount, "无促销时总金额应为原价")
+	assert.Equal(t, int64(0), result1.Response.DiscountAmt, "无促销时优惠金额为 0")
+	assert.Equal(t, "", result1.Response.PromoID, "无促销时 PromoID 为空")
+	t.Logf("  原价=%d, 成交价=%d, 优惠=%d ✓", originalPrice, result1.Response.UnitPrice, result1.Response.DiscountAmt)
+
+	t.Log("=== 阶段 2：设置促销（立即生效）===")
+	now := utils.NowUnix()
+	promoID := "PROMO-NEAR-EXPIRY-001"
+	setReq := &model.SetPromoRequest{
+		RequestID:     "PROMO-SET-001",
+		IdempotentKey: "PROMO-IDEM-001",
+		PromoID:       promoID,
+		PromoName:     "临期商品3.3折秒杀",
+		ShelfID:       shelfID,
+		SlotNo:        slotNo,
+		ProductID:     productID,
+		PromoPrice:    promoPrice,
+		StartAt:       now - 60,
+		EndAt:         now + 3600,
+		OperatorID:    "OP-001",
+		OperatorName:  "运营管理员",
+	}
+	setResult := service.SetPromo(ctx, setReq)
+	assert.Equal(t, utils.CodeSuccess, setResult.ErrCode, "设置促销应成功")
+	assert.True(t, setResult.Response.IsActive, "促销应处于激活状态")
+	assert.Equal(t, promoPrice, setResult.Response.PromoPrice, "促销价正确")
+	t.Logf("  促销[%s]已设置: 原价=%d分, 促销价=%d分 ✓", promoID, originalPrice, promoPrice)
+
+	t.Log("=== 阶段 3：促销生效，Pickup 应按促销价计算 ===")
+	req2 := &model.PickupRequest{
+		RequestID:     "REQ-PROMO-1",
+		IdempotentKey: "IDEM-PROMO-1",
+		ShelfID:       shelfID,
+		UserID:        "USER-002",
+		ProductID:     productID,
+		Quantity:      2,
+		SlotNo:        slotNo,
+	}
+	result2 := service.Pickup(ctx, req2, "127.0.0.1")
+	assert.Equal(t, utils.CodeSuccess, result2.ErrCode, "促销中扣减应成功")
+	assert.Equal(t, promoPrice, result2.Response.UnitPrice, "促销中单价应为促销价")
+	assert.Equal(t, originalPrice, result2.Response.OriginalPrice, "应返回原价")
+	assert.Equal(t, promoPrice*2, result2.Response.TotalAmount, "促销中总金额=促销价*数量")
+	assert.Equal(t, (originalPrice-promoPrice)*2, result2.Response.DiscountAmt, "优惠金额计算错误")
+	assert.Equal(t, promoID, result2.Response.PromoID, "PromoID 应正确返回")
+	assert.Equal(t, "临期商品3.3折秒杀", result2.Response.PromoName, "PromoName 应正确返回")
+	t.Logf("  原价=%d, 促销价=%d, 数量=2, 总金额=%d, 优惠=%d, promo_id=%s ✓",
+		originalPrice, result2.Response.UnitPrice, result2.Response.TotalAmount,
+		result2.Response.DiscountAmt, result2.Response.PromoID)
+
+	t.Log("=== 阶段 4：取消促销，Pickup 恢复原价 ===")
+	cancelReq := &model.CancelPromoRequest{
+		RequestID:    "PROMO-CANCEL-001",
+		PromoID:      promoID,
+		ShelfID:      shelfID,
+		SlotNo:       slotNo,
+		OperatorID:   "OP-001",
+		OperatorName: "运营管理员",
+	}
+	cancelResult := service.CancelPromo(ctx, cancelReq)
+	assert.Equal(t, utils.CodeSuccess, cancelResult.ErrCode, "取消促销应成功")
+	assert.True(t, cancelResult.Response.Canceled, "canceled=true")
+	t.Logf("  促销[%s]已取消 ✓", promoID)
+
+	req3 := &model.PickupRequest{
+		RequestID:     "REQ-AFTER-CANCEL-1",
+		IdempotentKey: "IDEM-AFTER-CANCEL-1",
+		ShelfID:       shelfID,
+		UserID:        "USER-003",
+		ProductID:     productID,
+		Quantity:      1,
+		SlotNo:        slotNo,
+	}
+	result3 := service.Pickup(ctx, req3, "127.0.0.1")
+	assert.Equal(t, utils.CodeSuccess, result3.ErrCode, "取消促销后扣减应成功")
+	assert.Equal(t, originalPrice, result3.Response.UnitPrice, "取消促销后应恢复原价")
+	assert.Equal(t, int64(0), result3.Response.DiscountAmt, "取消促销后优惠金额为 0")
+	assert.Equal(t, "", result3.Response.PromoID, "取消促销后 PromoID 为空")
+	t.Logf("  恢复原价=%d, 成交价=%d ✓", originalPrice, result3.Response.UnitPrice)
+
+	t.Log("=== 阶段 5：库存验证（10 - 1 - 2 - 1 = 6）===")
+	expectedFinal := initialStock - 1 - 2 - 1
+	actualStock, _ := client.Get(ctx, utils.BuildShelfStockKey(shelfID, slotNo)).Int()
+	assert.Equal(t, expectedFinal, actualStock, "最终库存应精准匹配")
+	t.Logf("  初始库存=%d, 扣减后=%d, 预期=%d ✓", initialStock, actualStock, expectedFinal)
+}
+
+func TestShelfService_Promo_Validation(t *testing.T) {
+	service, client, mr := setupTestShelfService(t)
+	defer mr.Close()
+
+	ctx := utils.ContextWithTraceID(context.Background(), "test-promo-validate")
+	shelfID := "SH-TEST-VALID"
+	slotNo := 1
+	productID := "P-VALID-001"
+	originalPrice := int64(500)
+
+	client.Set(ctx, utils.BuildShelfStockKey(shelfID, slotNo), 10, 0)
+	client.Set(ctx, utils.BuildShelfProductKey(shelfID, slotNo), productID, 0)
+	productJSON, _ := json.Marshal(&model.Product{ProductID: productID, SKU: "SKU-VALID", Name: "测试商品", Price: originalPrice})
+	client.Set(ctx, utils.BuildProductInfoKey(productID), productJSON, time.Hour)
+
+	now := utils.NowUnix()
+
+	t.Run("促销价必须大于0", func(t *testing.T) {
+		result := service.SetPromo(ctx, &model.SetPromoRequest{
+			RequestID: "V1", IdempotentKey: "V1",
+			PromoID: "V1", PromoName: "测试", ShelfID: shelfID, SlotNo: slotNo, ProductID: productID,
+			PromoPrice: 0, StartAt: now, EndAt: now + 3600, OperatorID: "OP", OperatorName: "OP",
+		})
+		assert.NotEqual(t, utils.CodeSuccess, result.ErrCode, "促销价=0应失败")
+	})
+
+	t.Run("促销价必须小于原价", func(t *testing.T) {
+		result := service.SetPromo(ctx, &model.SetPromoRequest{
+			RequestID: "V2", IdempotentKey: "V2",
+			PromoID: "V2", PromoName: "测试", ShelfID: shelfID, SlotNo: slotNo, ProductID: productID,
+			PromoPrice: originalPrice + 10, StartAt: now, EndAt: now + 3600, OperatorID: "OP", OperatorName: "OP",
+		})
+		assert.NotEqual(t, utils.CodeSuccess, result.ErrCode, "促销价>=原价应失败")
+	})
+
+	t.Run("时间范围无效（结束早于开始）", func(t *testing.T) {
+		result := service.SetPromo(ctx, &model.SetPromoRequest{
+			RequestID: "V3", IdempotentKey: "V3",
+			PromoID: "V3", PromoName: "测试", ShelfID: shelfID, SlotNo: slotNo, ProductID: productID,
+			PromoPrice: 100, StartAt: now + 3600, EndAt: now + 1800, OperatorID: "OP", OperatorName: "OP",
+		})
+		assert.NotEqual(t, utils.CodeSuccess, result.ErrCode, "结束时间早于开始时间应失败")
+	})
+
+	t.Log("  全部参数校验通过 ✓")
+}

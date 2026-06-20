@@ -88,8 +88,11 @@ type Transaction struct {
 	ProductName     string    `json:"product_name" gorm:"column:product_name;type:varchar(256);comment:商品名称快照"`
 	SlotNo          int       `json:"slot_no" gorm:"column:slot_no;type:int;comment:货道号"`
 	Quantity        int       `json:"quantity" gorm:"column:quantity;type:int;not null;comment:数量"`
-	UnitPrice       int64     `json:"unit_price" gorm:"column:unit_price;type:bigint;not null;comment:单价(分)"`
+	UnitPrice       int64     `json:"unit_price" gorm:"column:unit_price;type:bigint;not null;comment:成交单价(分)"`
+	OriginalPrice   int64     `json:"original_price" gorm:"column:original_price;type:bigint;comment:商品原价(分)"`
 	TotalAmount     int64     `json:"total_amount" gorm:"column:total_amount;type:bigint;not null;comment:总金额(分)"`
+	PromoID         string    `json:"promo_id" gorm:"column:promo_id;type:varchar(64);index:idx_promo_id;comment:促销活动ID"`
+	PromoName       string    `json:"promo_name" gorm:"column:promo_name;type:varchar(128);comment:促销活动名称"`
 	TxType          int       `json:"tx_type" gorm:"column:tx_type;type:tinyint;not null;default:1;comment:交易类型:1取货2补货3盘点调整4退货"`
 	TxStatus        int       `json:"tx_status" gorm:"column:tx_status;type:tinyint;not null;default:1;comment:状态:1待确认2已确认3已取消4异常"`
 	IdempotentKey   string    `json:"idempotent_key" gorm:"column:idempotent_key;type:varchar(128);uniqueIndex:uk_idempotent_key;comment:幂等键"`
@@ -105,4 +108,17 @@ type Transaction struct {
 
 func (Transaction) TableName() string {
 	return "transaction"
+}
+
+type ShelfPromotion struct {
+	PromoID    string `json:"promo_id"`
+	PromoName  string `json:"promo_name"`
+	ShelfID    string `json:"shelf_id"`
+	SlotNo     int    `json:"slot_no"`
+	ProductID  string `json:"product_id"`
+	PromoPrice int64  `json:"promo_price"`
+	StartAt    int64  `json:"start_at"`
+	EndAt      int64  `json:"end_at"`
+	CreatedBy  string `json:"created_by"`
+	CreatedAt  int64  `json:"created_at"`
 }

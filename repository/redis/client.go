@@ -157,13 +157,69 @@ for i = 1, #KEYS do
 end
 return table.concat(result, ',')
 `
+
+	getPromoLua = `
+local promo_key = KEYS[1]
+local now_ts = tonumber(ARGV[1])
+
+if redis.call('EXISTS', promo_key) == 0 then
+    return '0:'
+end
+
+local raw = redis.call('GET', promo_key)
+if not raw or raw == '' then
+    return '0:'
+end
+
+local promo_id, promo_name, product_id, promo_price, start_at, end_at, created_by = raw:match(
+    '([^|]+)|([^|]+)|([^|]+)|([^|]+)|([^|]+)|([^|]+)|([^|]+)'
+)
+if not promo_id then
+    return '0:'
+end
+
+local start_ts = tonumber(start_at)
+local end_ts = tonumber(end_at)
+
+if now_ts < start_ts then
+    return '-1:' .. raw
+end
+
+if now_ts > end_ts then
+    redis.call('DEL', promo_key)
+    return '-2:'
+end
+
+return '1:' .. raw
+`
+
+	cancelPromoLua = `
+local promo_key = KEYS[1]
+local expected_promo_id = ARGV[1]
+
+if redis.call('EXISTS', promo_key) == 0 then
+    return '0:NOT_FOUND'
+end
+
+local raw = redis.call('GET', promo_key)
+local promo_id = raw:match('([^|]+)')
+
+if expected_promo_id ~= '' and promo_id ~= expected_promo_id then
+    return '-1:MISMATCH:' .. (promo_id or '')
+end
+
+redis.call('DEL', promo_key)
+return '1:CANCELED'
+`
 )
 
 var (
-	decrStockScript    *redis.Script
-	lockShelfScript    *redis.Script
-	unlockShelfScript  *redis.Script
+	decrStockScript     *redis.Script
+	lockShelfScript     *redis.Script
+	unlockShelfScript   *redis.Script
 	getStockBatchScript *redis.Script
+	getPromoScript      *redis.Script
+	cancelPromoScript   *redis.Script
 )
 
 func init() {
@@ -171,4 +227,6 @@ func init() {
 	lockShelfScript = redis.NewScript(lockShelfLua)
 	unlockShelfScript = redis.NewScript(unlockShelfLua)
 	getStockBatchScript = redis.NewScript(getStockBatchLua)
+	getPromoScript = redis.NewScript(getPromoLua)
+	cancelPromoScript = redis.NewScript(cancelPromoLua)
 }

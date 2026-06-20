@@ -235,6 +235,42 @@ func (s *ShelfService) Pickup(ctx context.Context, req *model.PickupRequest, cli
 
 	_, _ = s.stockRepo.IncrETag(ctx, req.ShelfID)
 
+	unitPrice := product.Price
+	originalPrice := product.Price
+	discountAmt := int64(0)
+	promoID := ""
+	promoName := ""
+
+	promoResult, promoErr := s.stockRepo.GetPromo(ctx, req.ShelfID, req.SlotNo)
+	if promoErr != nil {
+		utils.SugarLogger.Warnw("get promo failed, fallback to original price",
+			zap.String("trace_id", traceID),
+			zap.String("shelf_id", req.ShelfID),
+			zap.Int("slot_no", req.SlotNo),
+			zap.Error(promoErr),
+		)
+	}
+	if promoResult != nil && promoResult.Found && promoResult.Active && promoResult.Promo != nil {
+		if promoResult.Promo.ProductID == "" || promoResult.Promo.ProductID == req.ProductID {
+			if promoResult.Promo.PromoPrice > 0 && promoResult.Promo.PromoPrice < product.Price {
+				unitPrice = promoResult.Promo.PromoPrice
+				promoID = promoResult.Promo.PromoID
+				promoName = promoResult.Promo.PromoName
+				discountAmt = (product.Price - unitPrice) * int64(req.Quantity)
+				utils.SugarLogger.Infow("promo applied",
+					zap.String("trace_id", traceID),
+					zap.String("promo_id", promoID),
+					zap.String("promo_name", promoName),
+					zap.Int64("original_price", originalPrice),
+					zap.Int64("promo_price", unitPrice),
+					zap.Int64("discount", discountAmt),
+				)
+			}
+		}
+	}
+
+	totalAmount := unitPrice * int64(req.Quantity)
+
 	txID := utils.GenerateTransactionID()
 	tx := &model.Transaction{
 		TransactionID: txID,
@@ -246,8 +282,11 @@ func (s *ShelfService) Pickup(ctx context.Context, req *model.PickupRequest, cli
 		ProductName:   product.Name,
 		SlotNo:        req.SlotNo,
 		Quantity:      req.Quantity,
-		UnitPrice:     product.Price,
-		TotalAmount:   product.Price * int64(req.Quantity),
+		UnitPrice:     unitPrice,
+		OriginalPrice: originalPrice,
+		TotalAmount:   totalAmount,
+		PromoID:       promoID,
+		PromoName:     promoName,
 		TxType:        1,
 		TxStatus:      2,
 		IdempotentKey: req.IdempotentKey,
@@ -277,8 +316,12 @@ func (s *ShelfService) Pickup(ctx context.Context, req *model.PickupRequest, cli
 		Quantity:      req.Quantity,
 		StockBefore:   decrResult.StockBefore,
 		StockAfter:    decrResult.StockAfter,
-		UnitPrice:     product.Price,
-		TotalAmount:   product.Price * int64(req.Quantity),
+		UnitPrice:     unitPrice,
+		OriginalPrice: originalPrice,
+		TotalAmount:   totalAmount,
+		DiscountAmt:   discountAmt,
+		PromoID:       promoID,
+		PromoName:     promoName,
 		PickupAt:      utils.NowUnixMilli(),
 		IsDuplicate:   false,
 	}
@@ -313,6 +356,10 @@ func reqFromMysqlSlotCheck(ctx context.Context, repo *mysqlrepo.ShelfRepo, shelf
 }
 
 func buildPickupResponseFromTx(tx *model.Transaction) *model.PickupResponse {
+	discountAmt := int64(0)
+	if tx.OriginalPrice > 0 && tx.OriginalPrice > tx.UnitPrice {
+		discountAmt = (tx.OriginalPrice - tx.UnitPrice) * int64(tx.Quantity)
+	}
 	return &model.PickupResponse{
 		TransactionID: tx.TransactionID,
 		ShelfID:       tx.ShelfID,
@@ -321,7 +368,11 @@ func buildPickupResponseFromTx(tx *model.Transaction) *model.PickupResponse {
 		StockBefore:   tx.StockBefore,
 		StockAfter:    tx.StockAfter,
 		UnitPrice:     tx.UnitPrice,
+		OriginalPrice: tx.OriginalPrice,
 		TotalAmount:   tx.TotalAmount,
+		DiscountAmt:   discountAmt,
+		PromoID:       tx.PromoID,
+		PromoName:     tx.PromoName,
 		PickupAt:      tx.CreatedAt.UnixMilli(),
 		IsDuplicate:   true,
 	}
@@ -675,4 +726,185 @@ func (s *ShelfService) SelfCheck(ctx context.Context, shelfID string, maxSlot in
 
 func (s *ShelfService) GetAuditLogs(ctx context.Context, shelfID string, limit int64) ([]string, error) {
 	return s.stockRepo.GetAuditLogs(ctx, shelfID, limit)
+}
+
+var (
+	ErrPromoInvalidPrice     = errors.New("促销价格必须大于 0 且小于原价")
+	ErrPromoInvalidTimeRange = errors.New("促销时间范围无效")
+	ErrPromoSlotNotFound     = errors.New("货道不存在或商品不匹配")
+)
+
+type SetPromoResult struct {
+	Response *model.SetPromoResponse
+	ErrCode  int
+	Err      error
+}
+
+func (s *ShelfService) SetPromo(ctx context.Context, req *model.SetPromoRequest) *SetPromoResult {
+	traceID := utils.TraceIDFromContext(ctx)
+	now := utils.NowUnix()
+
+	if req.StartAt >= req.EndAt {
+		return &SetPromoResult{ErrCode: utils.CodeBadRequest, Err: ErrPromoInvalidTimeRange}
+	}
+	if req.EndAt <= now {
+		return &SetPromoResult{ErrCode: utils.CodeBadRequest, Err: ErrPromoInvalidTimeRange}
+	}
+	if req.PromoPrice <= 0 {
+		return &SetPromoResult{ErrCode: utils.CodeBadRequest, Err: ErrPromoInvalidPrice}
+	}
+
+	sp, err := s.shelfRepo.GetShelfProduct(ctx, req.ShelfID, req.SlotNo)
+	if err != nil {
+		utils.SugarLogger.Errorw("get shelf product failed",
+			zap.String("trace_id", traceID),
+			zap.String("shelf_id", req.ShelfID),
+			zap.Int("slot_no", req.SlotNo),
+			zap.Error(err),
+		)
+		return &SetPromoResult{ErrCode: utils.CodeInternalError, Err: errors.New("服务异常")}
+	}
+
+	mysqlSlotProductID := ""
+	if sp != nil {
+		mysqlSlotProductID = sp.ProductID
+	} else {
+		redisProduct, redisErr := s.stockRepo.GetShelfProduct(ctx, req.ShelfID, req.SlotNo)
+		if redisErr == nil && redisProduct != "" {
+			mysqlSlotProductID = redisProduct
+			utils.SugarLogger.Warnw("MySQL shelf_product not found, fallback to Redis mapping",
+				zap.String("trace_id", traceID),
+				zap.String("shelf_id", req.ShelfID),
+				zap.Int("slot_no", req.SlotNo),
+				zap.String("redis_product", redisProduct),
+			)
+		}
+	}
+
+	if mysqlSlotProductID == "" {
+		return &SetPromoResult{ErrCode: utils.CodeNotFound, Err: ErrPromoSlotNotFound}
+	}
+	if mysqlSlotProductID != req.ProductID {
+		return &SetPromoResult{
+			ErrCode: utils.CodeSlotMismatch,
+			Err:     fmt.Errorf("%w: 货道商品=%s, 请求商品=%s", ErrPromoSlotNotFound, mysqlSlotProductID, req.ProductID),
+		}
+	}
+
+	product, err := s.getProductWithCache(ctx, req.ProductID)
+	if err != nil {
+		return &SetPromoResult{ErrCode: utils.CodeInternalError, Err: errors.New("服务异常")}
+	}
+	if product == nil {
+		return &SetPromoResult{ErrCode: utils.CodeProductNotFound, Err: ErrProductNotFound}
+	}
+	if req.PromoPrice >= product.Price {
+		return &SetPromoResult{
+			ErrCode: utils.CodeBadRequest,
+			Err:     fmt.Errorf("%w: 原价=%d分, 促销价=%d分", ErrPromoInvalidPrice, product.Price, req.PromoPrice),
+		}
+	}
+
+	promo := &model.ShelfPromotion{
+		PromoID:    req.PromoID,
+		PromoName:  req.PromoName,
+		ShelfID:    req.ShelfID,
+		SlotNo:     req.SlotNo,
+		ProductID:  req.ProductID,
+		PromoPrice: req.PromoPrice,
+		StartAt:    req.StartAt,
+		EndAt:      req.EndAt,
+		CreatedBy:  req.OperatorID,
+		CreatedAt:  now,
+	}
+
+	if err := s.stockRepo.SetPromo(ctx, promo); err != nil {
+		utils.SugarLogger.Errorw("set promo failed",
+			zap.String("trace_id", traceID),
+			zap.String("promo_id", req.PromoID),
+			zap.String("shelf_id", req.ShelfID),
+			zap.Error(err),
+		)
+		return &SetPromoResult{
+			ErrCode: utils.CodeServiceUnavailable,
+			Err:     errors.New("促销服务暂不可用"),
+		}
+	}
+
+	utils.SugarLogger.Infow("promo set successfully",
+		zap.String("trace_id", traceID),
+		zap.String("promo_id", req.PromoID),
+		zap.String("promo_name", req.PromoName),
+		zap.String("shelf_id", req.ShelfID),
+		zap.Int("slot_no", req.SlotNo),
+		zap.String("product_id", req.ProductID),
+		zap.Int64("original_price", product.Price),
+		zap.Int64("promo_price", req.PromoPrice),
+		zap.Int64("start_at", req.StartAt),
+		zap.Int64("end_at", req.EndAt),
+		zap.String("operator", req.OperatorID),
+	)
+
+	return &SetPromoResult{
+		Response: &model.SetPromoResponse{
+			PromoID:    req.PromoID,
+			ShelfID:    req.ShelfID,
+			SlotNo:     req.SlotNo,
+			ProductID:  req.ProductID,
+			PromoPrice: req.PromoPrice,
+			StartAt:    req.StartAt,
+			EndAt:      req.EndAt,
+			CreatedAt:  now,
+			IsActive:   req.StartAt <= now && now <= req.EndAt,
+		},
+		ErrCode: utils.CodeSuccess,
+	}
+}
+
+type CancelPromoResult struct {
+	Response *model.CancelPromoResponse
+	ErrCode  int
+	Err      error
+}
+
+func (s *ShelfService) CancelPromo(ctx context.Context, req *model.CancelPromoRequest) *CancelPromoResult {
+	traceID := utils.TraceIDFromContext(ctx)
+
+	canceled, err := s.stockRepo.CancelPromo(ctx, req.ShelfID, req.SlotNo, req.PromoID)
+	if err != nil {
+		utils.SugarLogger.Errorw("cancel promo failed",
+			zap.String("trace_id", traceID),
+			zap.String("promo_id", req.PromoID),
+			zap.String("shelf_id", req.ShelfID),
+			zap.Error(err),
+		)
+		return &CancelPromoResult{
+			ErrCode: utils.CodeServiceUnavailable,
+			Err:     errors.New("促销服务暂不可用"),
+		}
+	}
+
+	utils.SugarLogger.Infow("promo canceled",
+		zap.String("trace_id", traceID),
+		zap.String("promo_id", req.PromoID),
+		zap.String("shelf_id", req.ShelfID),
+		zap.Int("slot_no", req.SlotNo),
+		zap.Bool("canceled", canceled),
+		zap.String("operator", req.OperatorID),
+	)
+
+	return &CancelPromoResult{
+		Response: &model.CancelPromoResponse{
+			PromoID:    req.PromoID,
+			ShelfID:    req.ShelfID,
+			SlotNo:     req.SlotNo,
+			Canceled:   canceled,
+			CanceledAt: utils.NowUnix(),
+		},
+		ErrCode: utils.CodeSuccess,
+	}
+}
+
+func (s *ShelfService) GetPromo(ctx context.Context, shelfID string, slotNo int) (*redisrepo.PromoGetResult, error) {
+	return s.stockRepo.GetPromo(ctx, shelfID, slotNo)
 }
